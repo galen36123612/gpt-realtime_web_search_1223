@@ -1,4 +1,4 @@
-// 1223 add gpt-realtime + gpt + web_search
+// 1223 add gpt-realtime + gpt-4o-search-preview + prompt
 export const runtime = "nodejs";
 
 type WebSearchReq = {
@@ -15,6 +15,21 @@ function normalizeDomains(domains: string[]): string[] {
     .filter(Boolean)
     .map((d) => d.replace(/^https?:\/\//i, "").replace(/\/+$/g, ""));
   return Array.from(new Set(cleaned)).slice(0, 100);
+}
+
+function getTaipeiNowISO(): string {
+  // 產生類似 2025-12-23T15:35:29 的字串（台北時間）
+  const s = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Asia/Taipei",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(new Date());
+  return s.replace(" ", "T");
 }
 
 function extractOutputTextFromResponses(resp: any): string {
@@ -80,12 +95,21 @@ export async function POST(req: Request) {
     const model = process.env.WEB_SEARCH_MODEL || "gpt-4o-mini";
     const isSearchPreviewModel = /-search-(preview|api)\b/i.test(model);
 
+    // ✅ A 方法：把「台北時間」當成 prompt 錨點
+    const taipeiNow = getTaipeiNowISO();
+
     const basePrompt = [
       "你是一個搜尋助理。請在需要時使用網路最新資訊，並用繁體中文回答。",
+      "",
+      "【時間基準】",
+      `- 現在的台北時間（Asia/Taipei）是：${taipeiNow}`,
+      "- 使用者提到「今天/昨日/最近/本週」等相對時間，一律以 Asia/Taipei 推算，不要用 UTC。",
+      "",
       "輸出格式：",
-      "- 先給結論（2~6 點條列）",
-      "- 再給來源清單（title + url）",
-      "- 若資訊不確定或來源矛盾，請明確說明不確定點，避免瞎猜",
+      "- 【結論】1-2 句直接回答",
+      "- 【重點】2~6 點條列（每點盡量可由來源支持）",
+      "- 【來源】列出使用到的來源（title + url）",
+      "- 若資訊不確定或來源矛盾，請明確說明不確定點與差異，避免瞎猜",
       recency_days > 0 ? `- 盡量優先使用最近 ${recency_days} 天資訊（若能找到）` : "",
       domains.length ? `- 若可行，優先參考這些網域：${domains.join(", ")}` : "",
       "",
@@ -122,7 +146,7 @@ export async function POST(req: Request) {
       return Response.json({
         answer,
         citations: citations.slice(0, 10),
-        meta: { query, recency_days, domains, model, mode: "chat_completions" },
+        meta: { query, recency_days, domains, model, mode: "chat_completions", taipeiNow },
       });
     }
 
@@ -162,7 +186,7 @@ export async function POST(req: Request) {
     return Response.json({
       answer,
       citations: citations.slice(0, 10),
-      meta: { query, recency_days, domains, model, mode: "responses" },
+      meta: { query, recency_days, domains, model, mode: "responses", taipeiNow },
     });
   } catch (e: any) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
