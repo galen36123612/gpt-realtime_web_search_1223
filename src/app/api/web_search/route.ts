@@ -7,18 +7,25 @@ type WebSearchReq = {
   domains?: string[];
 };
 
-function extractOutputText(resp: any): string {
-  // 1) 若 API 回傳有 output_text，直接用
-  if (typeof resp?.output_text === "string" && resp.output_text.trim()) return resp.output_text;
+type UrlCitation = { title?: string; url?: string };
 
-  // 2) 否則從 output 裡拼出文字
+function normalizeDomains(domains: string[]): string[] {
+  const cleaned = domains
+    .map((d) => String(d || "").trim())
+    .filter(Boolean)
+    .map((d) => d.replace(/^https?:\/\//i, "").replace(/\/+$/g, ""));
+  return Array.from(new Set(cleaned)).slice(0, 100);
+}
+
+function extractOutputTextFromResponses(resp: any): string {
+  if (typeof resp?.output_text === "string" && resp.output_text.trim()) return resp.output_text.trim();
+
   let text = "";
   const output = Array.isArray(resp?.output) ? resp.output : [];
   for (const item of output) {
     if (item?.type !== "message") continue;
     const content = Array.isArray(item?.content) ? item.content : [];
     for (const part of content) {
-      // 常見：{ type: "output_text", text: "..." } 或 { type: "text", text: "..." }
       if ((part?.type === "output_text" || part?.type === "text") && typeof part?.text === "string") {
         text += part.text;
       }
@@ -27,21 +34,33 @@ function extractOutputText(resp: any): string {
   return text.trim();
 }
 
-function extractUrlCitations(resp: any): Array<{ title?: string; url?: string }> {
-  const citations: Array<{ title?: string; url?: string }> = [];
+function extractUrlCitationsFromResponses(resp: any): UrlCitation[] {
+  const citations: UrlCitation[] = [];
   const output = Array.isArray(resp?.output) ? resp.output : [];
-
   for (const item of output) {
     if (item?.type !== "message") continue;
     const content = Array.isArray(item?.content) ? item.content : [];
     for (const part of content) {
       const annotations = Array.isArray(part?.annotations) ? part.annotations : [];
       for (const ann of annotations) {
-        if (ann?.type === "url_citation") {
-          citations.push({ title: ann.title, url: ann.url });
-        }
+        if (ann?.type === "url_citation") citations.push({ title: ann.title, url: ann.url });
       }
     }
+  }
+  return citations;
+}
+
+function extractOutputTextFromChat(resp: any): string {
+  const content = resp?.choices?.[0]?.message?.content;
+  return typeof content === "string" ? content.trim() : "";
+}
+
+function extractUrlCitationsFromChat(resp: any): UrlCitation[] {
+  const anns = resp?.choices?.[0]?.message?.annotations;
+  const arr = Array.isArray(anns) ? anns : [];
+  const citations: UrlCitation[] = [];
+  for (const ann of arr) {
+    if (ann?.type === "url_citation") citations.push({ title: ann.title, url: ann.url });
   }
   return citations;
 }
@@ -49,41 +68,71 @@ function extractUrlCitations(resp: any): Array<{ title?: string; url?: string }>
 export async function POST(req: Request) {
   try {
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return Response.json({ error: "Missing OPENAI_API_KEY" }, { status: 500 });
-    }
+    if (!apiKey) return Response.json({ error: "Missing OPENAI_API_KEY" }, { status: 500 });
 
     const body = (await req.json()) as WebSearchReq;
-
     const query = String(body?.query || "").trim();
     const recency_days = Number.isFinite(body?.recency_days) ? Number(body.recency_days) : 30;
-    const domains = Array.isArray(body?.domains) ? body.domains.filter(Boolean).map(String) : [];
+    const domains = normalizeDomains(Array.isArray(body?.domains) ? body.domains : []);
 
-    if (!query) {
-      return Response.json({ error: "Missing required field: query" }, { status: 400 });
+    if (!query) return Response.json({ error: "Missing required field: query" }, { status: 400 });
+
+    const model = process.env.WEB_SEARCH_MODEL || "gpt-4o-mini";
+    const isSearchPreviewModel = /-search-(preview|api)\b/i.test(model);
+
+    const basePrompt = [
+      "你是一個搜尋助理。請在需要時使用網路最新資訊，並用繁體中文回答。",
+      "輸出格式：",
+      "- 先給結論（2~6 點條列）",
+      "- 再給來源清單（title + url）",
+      "- 若資訊不確定或來源矛盾，請明確說明不確定點，避免瞎猜",
+      recency_days > 0 ? `- 盡量優先使用最近 ${recency_days} 天資訊（若能找到）` : "",
+      domains.length ? `- 若可行，優先參考這些網域：${domains.join(", ")}` : "",
+      "",
+      `問題：${query}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    if (isSearchPreviewModel) {
+      // ✅ Chat Completions：用 search-preview 專用模型
+      const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: "user", content: basePrompt }],
+        }),
+      });
+
+      const respJson = await upstream.json().catch(() => null);
+      if (!upstream.ok) {
+        return Response.json(
+          { error: "OpenAI chat/completions error", status: upstream.status, statusText: upstream.statusText, details: respJson },
+          { status: 500 }
+        );
+      }
+
+      const answer = extractOutputTextFromChat(respJson);
+      const citations = extractUrlCitationsFromChat(respJson);
+
+      return Response.json({
+        answer,
+        citations: citations.slice(0, 10),
+        meta: { query, recency_days, domains, model, mode: "chat_completions" },
+      });
     }
 
-    // ✅ 把 recency_days / domains 真正用到（避免 ESLint unused）
-    const domainHint = domains.length ? `\n- 優先只使用這些網域：${domains.join(", ")}` : "";
-    const recencyHint = recency_days > 0 ? `\n- 優先參考最近 ${recency_days} 天內的資訊（若可取得）` : "";
-
-    // 你可以用 env 覆蓋模型（避免你環境沒有 gpt-5 之類）
-    const model = process.env.WEB_SEARCH_MODEL || "gpt-4o-mini";
-
-    const input = `請先做網路搜尋，再用繁體中文給出「可核對」的答案。
-
-規則（精簡版）：
-- 只根據搜尋結果作答；關鍵事實需可對應來源；不確定就明講。
-- 優先用 2 個獨立可靠來源交叉驗證；若無法驗證或來源矛盾，列出差異並說明採信理由（官方/第一方優先）。
-- 若資料不可得（下架/付費/動態頁/不存在），說明原因，並給「最接近且可驗證」的替代資訊，清楚標註替代條件。
-
-輸出：
-1) 重點(3-6點，每點附[來源#])
-2) 關鍵細節(必要時用表格/條列，每列附[來源#])
-3) 來源清單(# title + url)
-
-查詢：${query}${recencyHint}${domainHint}`;
-
+    // ✅ Responses：一般模型 + web_search tool（支援 domain filtering）
+    const tools: any[] = [
+      {
+        type: "web_search",
+        ...(domains.length ? { filters: { allowed_domains: domains } } : {}),
+      },
+    ];
 
     const upstream = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
@@ -93,41 +142,32 @@ export async function POST(req: Request) {
       },
       body: JSON.stringify({
         model,
-        tools: [{ type: "web_search" }],
-        input,
+        tools,
+        tool_choice: "auto",
+        input: basePrompt,
       }),
     });
 
     const respJson = await upstream.json().catch(() => null);
-
     if (!upstream.ok) {
       return Response.json(
-        {
-          error: "OpenAI responses API error",
-          status: upstream.status,
-          statusText: upstream.statusText,
-          details: respJson,
-        },
+        { error: "OpenAI responses error", status: upstream.status, statusText: upstream.statusText, details: respJson },
         { status: 500 }
       );
     }
 
-    const answer = extractOutputText(respJson);
-    const citations = extractUrlCitations(respJson);
+    const answer = extractOutputTextFromResponses(respJson);
+    const citations = extractUrlCitationsFromResponses(respJson);
 
     return Response.json({
       answer,
       citations: citations.slice(0, 10),
-      meta: {
-        query,
-        recency_days,
-        domains,
-        model,
-      },
+      meta: { query, recency_days, domains, model, mode: "responses" },
     });
   } catch (e: any) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
 }
+
 
 
