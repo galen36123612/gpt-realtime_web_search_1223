@@ -68,9 +68,16 @@ export async function POST(req: Request) {
     const recencyHint = recency_days > 0 ? `\n- 優先參考最近 ${recency_days} 天內的資訊（若可取得）` : "";
 
     // 你可以用 env 覆蓋模型（避免你環境沒有 gpt-5 之類）
-    const model = process.env.WEB_SEARCH_MODEL || "gpt-5";
+    const model = process.env.WEB_SEARCH_MODEL || "gpt-4o-mini";
 
-    const input = `你是一個搜尋助理。請先做網路搜尋，再以繁體中文整理結果。 需求： - 先列出 3-6 個重點（條列） - 再列出來源（每筆包含：title + url） - 若來源之間資訊互相矛盾，請指出並以較可靠來源為主 查詢：${query}${recencyHint}${domainHint}`;
+    const input = `你是一個搜尋助理。請先做網路搜尋，再以繁體中文整理結果。
+
+需求：
+- 先列出 3-6 個重點（條列）
+- 再列出來源（每筆包含：title + url）
+- 若來源之間資訊互相矛盾，請指出並以較可靠來源為主
+
+查詢：${query}${recencyHint}${domainHint}`;
 
 
     const upstream = await fetch("https://api.openai.com/v1/responses", {
