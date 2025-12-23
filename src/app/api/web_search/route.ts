@@ -97,26 +97,33 @@ export async function POST(req: Request) {
 
     // ✅ A 方法：把「台北時間」當成 prompt 錨點
     const taipeiNow = getTaipeiNowISO();
+const taipeiToday = taipeiNow.slice(0, 10); // YYYY-MM-DD
 
-    const basePrompt = [
-      "你是一個搜尋助理。請在需要時使用網路最新資訊，並用繁體中文回答。",
-      "",
-      "【時間基準】",
-      `- 現在的台北時間（Asia/Taipei）是：${taipeiNow}`,
-      "- 使用者提到「今天/昨日/最近/本週」等相對時間，一律以 Asia/Taipei 推算，不要用 UTC。",
-      "",
-      "輸出格式：",
-      "- 【結論】1-2 句直接回答",
-      "- 【重點】2~6 點條列（每點盡量可由來源支持）",
-      "- 【來源】列出使用到的來源（title + url）",
-      "- 若資訊不確定或來源矛盾，請明確說明不確定點與差異，避免瞎猜",
-      recency_days > 0 ? `- 盡量優先使用最近 ${recency_days} 天資訊（若能找到）` : "",
-      domains.length ? `- 若可行，優先參考這些網域：${domains.join(", ")}` : "",
-      "",
-      `問題：${query}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+const basePrompt = [
+  "你是一個搜尋助理。請在需要時使用網路最新資訊，並用繁體中文回答。",
+  "",
+  "【時間基準】",
+  `- 現在的台北時間（Asia/Taipei）是：${taipeiNow}`,
+  "- 使用者提到「今天/昨日/最近/本週」等相對時間，一律以 Asia/Taipei 推算，不要用 UTC。",
+  "",
+  "【數值/價格類問題的硬規則（務必遵守）】",
+  `- 若問題涉及「價格/股價/收盤價/匯率」：答案一定要包含「該數值所對應的日期（Asia/Taipei）」；沒有日期就視為不可用來源。`,
+  `- 若使用者問「今天收盤價」：以台北時間「${taipeiToday}」為今天；若今天尚未收盤或休市，請改用「最近一個交易日」並明確寫出日期（不要假裝是今天）。`,
+  "- 優先使用一手/權威報價來源（交易所/大型資料商/報價頁），避免採用新聞文章內文引用的價格當作收盤價。",
+  "- 若找到的價格彼此矛盾，請列出差異並說明你採信哪個來源與原因；不確定就直接說無法確認。",
+  "",
+  "輸出格式：",
+  "- 【結論】1-2 句直接回答（若不是今天，請在這裡就講清楚是哪一天）",
+  "- 【重點】2~6 點條列",
+  "- 【來源】列出使用到的來源（title + url）",
+  "",
+  recency_days > 0 ? `- 盡量優先使用最近 ${recency_days} 天資訊（若能找到）` : "",
+  domains.length ? `- 若可行，優先參考這些網域：${domains.join(", ")}` : "",
+  "",
+  `問題：${query}`,
+]
+  .filter(Boolean)
+  .join("\n");
 
     if (isSearchPreviewModel) {
       // ✅ Chat Completions：用 search-preview 專用模型
