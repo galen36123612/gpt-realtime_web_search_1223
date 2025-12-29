@@ -386,10 +386,10 @@ async function fetchTwseStockDayMonth(stockNo: string, yyyy: number, mm: number)
     headers: {
       // 某些環境對沒有 UA 的請求比較敏感
       "User-Agent": "Mozilla/5.0",
-      Accept: "application/json,text/plain,*/*",
+      Accept: "application/json,text/plain,*",
     },
   });
-/*
+
   if (!res.ok) {
     throw new Error(`TWSE fetch failed: ${res.status} ${res.statusText}`);
   }
