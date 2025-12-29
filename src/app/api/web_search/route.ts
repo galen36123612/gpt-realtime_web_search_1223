@@ -754,16 +754,6 @@ function getTaipeiNowParts() {
   };
 }
 
-function addDaysToYMD(ymd: string, deltaDays: number): string {
-  const [y, m, d] = ymd.split("-").map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + deltaDays);
-  const yy = dt.getUTCFullYear();
-  const mm = pad2(dt.getUTCMonth() + 1);
-  const dd = pad2(dt.getUTCDate());
-  return `${yy}-${mm}-${dd}`;
-}
-
 /** 支援：YYYY-MM-DD / YYYY/MM/DD / YYYY年MM月DD日 / MM/DD(用當年) */
 function parseDateFromQuery(query: string, defaultYear: number): { ymd: string; explicit: boolean } | null {
   const q = query;
@@ -1117,7 +1107,7 @@ export async function POST(req: Request) {
             const sameDay = twse.ymd === targetYmd;
 
             // 如果使用者問「今天」但 TWSE 日資料尚未更新到今天
-            // → 回「最近可得交易日」＋（可選）補上 MIS 最新價
+            // → 回「最近可得交易日」＋補 MIS 最新價
             if (!sameDay && targetYmd === taipei.ymd && mentionsToday(query)) {
               const mis = await fetchMisQuote(stockNo).catch(() => null);
               const m = mis?.msg;
@@ -1129,19 +1119,13 @@ export async function POST(req: Request) {
                 `台北時間基準：${taipeiNow}\n\n` +
                 `查詢代號：${stockNo}.TW\n` +
                 `⚠️ TWSE（日資料/官方收盤）尚未提供 ${targetYmd} 的收盤資料（可能尚未更新或非交易日）。\n` +
-                `目前 TWSE 最新可得交易日：${twse.ymd} 收盤價：${twse.close} TWD\n` +
+                `目前 TWSE 最新可得交易日：${twse.ymd} 官方收盤價：${twse.close} TWD\n` +
                 `（開/高/低：${twse.open ?? "—"} / ${twse.high ?? "—"} / ${twse.low ?? "—"}）\n` +
                 (twse.volume != null ? `成交股數：${twse.volume}\n` : "") +
-                (last != null
-                  ? `\n補充：TWSE MIS 最新成交價：${last} TWD（更新：${misTs ?? "—"}）`
-                  : "");
+                (last != null ? `\n補充：TWSE MIS 最新成交價：${last} TWD（更新：${misTs ?? "—"}）` : "");
 
-              const citations: UrlCitation[] = [
-                { title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl },
-              ];
-              if (mis?.url && last != null) {
-                citations.push({ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis.url });
-              }
+              const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl }];
+              if (mis?.url && last != null) citations.push({ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis.url });
 
               return Response.json({
                 answer,
@@ -1157,7 +1141,6 @@ export async function POST(req: Request) {
               });
             }
 
-            // 正常：當天或指定日期已命中
             const answer =
               `台北時間基準：${taipeiNow}\n\n` +
               `查詢代號：${stockNo}.TW\n` +
@@ -1167,29 +1150,20 @@ export async function POST(req: Request) {
               `\n（開/高/低：${twse.open ?? "—"} / ${twse.high ?? "—"} / ${twse.low ?? "—"}）` +
               (twse.volume != null ? `\n成交股數：${twse.volume}` : "");
 
-            const citations: UrlCitation[] = [
-              { title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl },
-            ];
+            const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl }];
 
             return Response.json({
               answer,
               citations,
-              meta: {
-                query,
-                mode: "twse_stock_day",
-                stockNo,
-                targetYmd,
-                resolvedYmd: twse.ymd,
-                taipeiNow,
-              },
+              meta: { query, mode: "twse_stock_day", stockNo, targetYmd, resolvedYmd: twse.ymd, taipeiNow },
             });
           }
         } catch {
-          // 如果日資料失敗，就往下改打 MIS 即時或走 web search
+          // 日資料失敗 → 往下 MIS
         }
       }
 
-      // --- B) 否則：走 MIS 即時（現在多少錢） ---
+      // --- B) 走 MIS 即時（現在多少錢） ---
       const mis = await fetchMisQuote(stockNo).catch(() => null);
       if (mis?.msg) {
         const m = mis.msg;
@@ -1199,7 +1173,6 @@ export async function POST(req: Request) {
         const high = toNumberMaybe(m.h);
         const low = toNumberMaybe(m.l);
         const vol = toNumberMaybe(m.v);
-
         const ts = formatMisDatetime(m.d, m.t);
 
         const lastText =
@@ -1217,18 +1190,11 @@ export async function POST(req: Request) {
         return Response.json({
           answer,
           citations,
-          meta: {
-            query,
-            mode: "mis_realtime",
-            market: mis.market,
-            stockNo,
-            taipeiNow,
-            mis_datetime: ts,
-          },
+          meta: { query, mode: "mis_realtime", market: mis.market, stockNo, taipeiNow, mis_datetime: ts },
         });
       }
 
-      // MIS 也失敗 → 最後 fallback：嘗試日資料（避免完全沒回）
+      // MIS 失敗 → 最後 fallback 日資料（避免完全沒回）
       try {
         const targetYmd = parsed?.ymd ?? taipei.ymd;
         const twse = await getTwseCloseForDateOrPrev(stockNo, targetYmd);
@@ -1237,7 +1203,7 @@ export async function POST(req: Request) {
             `台北時間基準：${taipeiNow}\n\n` +
             `查詢代號：${stockNo}.TW\n` +
             `⚠️ 即時報價暫不可用，先提供 TWSE 日資料（官方收盤/歷史）\n` +
-            `最新可得交易日：${twse.ymd} 收盤價：${twse.close} TWD`;
+            `最新可得交易日：${twse.ymd} 官方收盤價：${twse.close} TWD`;
 
           const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl }];
 
@@ -1357,6 +1323,7 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
 }
+
 
 
 
