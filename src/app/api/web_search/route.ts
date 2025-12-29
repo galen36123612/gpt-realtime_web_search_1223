@@ -742,23 +742,13 @@ function getTaipeiNowParts() {
   const hh = map.hour!;
   const mm = map.minute!;
   const ss = map.second!;
-  const iso = `${y}-${m}-${d}T${hh}:${mm}:${ss}`;
-  const ymd = `${y}-${m}-${d}`;
-  return { iso, ymd, hour: Number(hh), minute: Number(mm), second: Number(ss) };
-}
-
-function isPriceQuery(query: string): boolean {
-  const q = query.toLowerCase();
-  const kws = ["股價", "收盤", "收盤價", "開盤", "最高", "最低", "成交", "成交價", "報價", "price", "close", "quote", "open"];
-  return kws.some((k) => q.includes(k));
-}
-
-function isRealtimeIntent(query: string): boolean {
-  return /現在|即時|盤中|現價|最新|多少錢|幾塊|報價|last|quote|price/i.test(query);
-}
-
-function mentionsToday(query: string): boolean {
-  return /今天|今日|本日/i.test(query);
+  return {
+    iso: `${y}-${m}-${d}T${hh}:${mm}:${ss}`,
+    ymd: `${y}-${m}-${d}`,
+    hour: Number(hh),
+    minute: Number(mm),
+    second: Number(ss),
+  };
 }
 
 /** 支援：YYYY-MM-DD / YYYY/MM/DD / YYYY年MM月DD日 / MM/DD(用當年) */
@@ -774,10 +764,32 @@ function parseDateFromQuery(query: string, defaultYear: number): { ymd: string; 
   return null;
 }
 
+function toNumberMaybe(x: any): number | null {
+  const s = String(x ?? "").replace(/,/g, "").trim();
+  if (!s || s === "--" || s === "-" || s.toLowerCase() === "nan") return null;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function isPriceQuery(query: string): boolean {
+  const q = query.toLowerCase();
+  const kws = ["股價", "收盤", "收盤價", "開盤", "最高", "最低", "成交", "成交價", "報價", "price", "close", "quote", "open", "現價"];
+  return kws.some((k) => q.includes(k));
+}
+
+function isRealtimeIntent(query: string): boolean {
+  return /現在|即時|盤中|現價|最新|多少錢|幾塊|報價|last|quote|price/i.test(query);
+}
+
+function mentionsToday(query: string): boolean {
+  return /今天|今日|本日/i.test(query);
+}
+
 /** 從 query 盡量推測台股代號（4位數） */
 function inferTwseStockNo(query: string): string | null {
   const q = query;
 
+  // 少量常見映射（可留著加速），但 B 方案不靠它也行
   const nameMap: Array<[RegExp, string]> = [
     [/台積電|tsmc/i, "2330"],
     [/鴻海/i, "2317"],
@@ -788,12 +800,14 @@ function inferTwseStockNo(query: string): string | null {
   ];
   for (const [re, code] of nameMap) if (re.test(q)) return code;
 
-  const twMatch = q.match(/(?:^|[^\d])(\d{4})\s*(?:\.?tw)?(?:[^\d]|$)/i);
+  // 2330.TW / 2330tw / (2330)
+  const twMatch = q.match(/(?:^|[^\d])(\d{4})\s*(?:\.?tw|\.?two)?(?:[^\d]|$)/i);
   if (twMatch) {
     const code = twMatch[1];
     if (!["2024", "2025", "2026"].includes(code)) return code;
   }
 
+  // 其他四位數，但排除年份/日期語境
   const re = /\d{4}/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(q))) {
@@ -809,14 +823,123 @@ function inferTwseStockNo(query: string): string | null {
   return null;
 }
 
-function toNumberMaybe(x: any): number | null {
-  const s = String(x ?? "").replace(/,/g, "").trim();
-  if (!s || s === "--" || s === "-" || s.toLowerCase() === "nan") return null;
-  const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+/** =============== B 方案：Yahoo Search 解析公司名 → 台股代號/市場 =============== */
+
+type YahooSearchQuote = {
+  symbol?: string;
+  shortname?: string;
+  longname?: string;
+  exchange?: string; // e.g., "TAI", "TWO", "NYQ"
+  exchDisp?: string;
+  quoteType?: string; // "EQUITY"
+  typeDisp?: string; // may include ETF
+};
+
+function extractSearchKeyword(query: string): string {
+  // 去掉常見股價問句詞，把剩下的當作公司名/代號搜尋詞
+  const removed = query
+    .replace(/\d{4}(\.TW|\.TWO)?/gi, " ")
+    .replace(/(現在|即時|盤中|現價|最新|多少錢|幾塊|股價|收盤價?|開盤|最高|最低|成交價?|報價|price|close|quote|open|last)/gi, " ")
+    .replace(/[()（）,，。！？!?]/g, " ")
+    .trim();
+  return removed.length >= 2 ? removed : query.trim();
+}
+
+function parseYahooSymbolToStockNo(symbol: string): { stockNo: string; marketHint: "tse" | "otc" } | null {
+  const m = symbol.match(/^(\d{4})\.(TW|TWO)$/i);
+  if (!m) return null;
+  const stockNo = m[1];
+  const suf = m[2].toUpperCase();
+  return { stockNo, marketHint: suf === "TWO" ? "otc" : "tse" };
+}
+
+async function fetchYahooSearch(keyword: string): Promise<{ url: string; quotes: YahooSearchQuote[] } | null> {
+  const url = `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(keyword)}&quotesCount=10&newsCount=0`;
+
+  const res = await fetch(url, {
+    method: "GET",
+    cache: "no-store",
+    headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json,text/plain,*/*" },
+  });
+  if (!res.ok) return null;
+
+  const json: any = await res.json().catch(() => null);
+  const quotes: YahooSearchQuote[] = Array.isArray(json?.quotes) ? json.quotes : [];
+  return { url, quotes };
+}
+
+function scoreYahooCandidate(q: YahooSearchQuote, keyword: string, originalQuery: string): number {
+  const symbol = String(q.symbol || "");
+  if (!symbol) return -999;
+
+  // 台股優先
+  const isTw = /\.TW$|\.TWO$/i.test(symbol);
+  if (!isTw) return -50;
+
+  let score = 0;
+
+  // 上市稍微比上櫃優先（可調）
+  if (/\.TW$/i.test(symbol)) score += 2;
+  if (/\.TWO$/i.test(symbol)) score += 1;
+
+  // 只要是 equity 就加分
+  if (String(q.quoteType || "").toUpperCase() === "EQUITY") score += 2;
+
+  // 避免 ETF/基金優先於個股（可調）
+  const typeDisp = String(q.typeDisp || "").toLowerCase();
+  if (typeDisp.includes("etf")) score -= 2;
+
+  const name = `${q.shortname || ""} ${q.longname || ""} ${q.exchDisp || ""} ${q.exchange || ""}`.toLowerCase();
+  const kw = keyword.toLowerCase().trim();
+  const oq = originalQuery.toLowerCase();
+
+  if (kw && name.includes(kw)) score += 6;
+  if (kw && oq.includes(kw)) score += 2;
+
+  // 若 query 本身含「化」等更精確字，讓對應名稱更容易勝出（例如 台塑化）
+  if (oq.includes("台塑化") && name.includes("台塑化")) score += 6;
+  if (oq.includes("台塑") && name.includes("台塑")) score += 2;
+
+  return score;
+}
+
+async function resolveTwStockFromYahoo(query: string): Promise<
+  | {
+      stockNo: string;
+      marketHint: "tse" | "otc";
+      yahooSymbol: string;
+      sourceUrl: string;
+      displayName?: string;
+    }
+  | null
+> {
+  const keyword = extractSearchKeyword(query);
+  const res = await fetchYahooSearch(keyword);
+  if (!res) return null;
+
+  const candidates = res.quotes
+    .filter((q) => q?.symbol && /\.TW$|\.TWO$/i.test(String(q.symbol)))
+    .map((q) => ({ q, score: scoreYahooCandidate(q, keyword, query) }))
+    .sort((a, b) => b.score - a.score);
+
+  if (!candidates.length) return null;
+
+  const best = candidates[0].q;
+  const symbol = String(best.symbol || "");
+  const parsed = parseYahooSymbolToStockNo(symbol);
+  if (!parsed) return null;
+
+  return {
+    stockNo: parsed.stockNo,
+    marketHint: parsed.marketHint,
+    yahooSymbol: symbol,
+    sourceUrl: res.url,
+    displayName: best.shortname || best.longname || undefined,
+  };
 }
 
 /** ==================== TWSE 日資料（收盤/歷史） ==================== */
+
 function parseTwseRowDateToISO(s: string): string | null {
   const m = String(s).trim().match(/^(\d{2,4})\/(\d{1,2})\/(\d{1,2})$/);
   if (!m) return null;
@@ -850,7 +973,7 @@ async function getTwseCloseForDateOrPrev(stockNo: string, targetYmd: string) {
   tryMonths.push({ yy: prev.getUTCFullYear(), mm: prev.getUTCMonth() + 1 });
 
   let best:
-    | { ymd: string; row: string[]; sourceUrl: string; fields?: string[]; closeIdx: number }
+    | { ymd: string; row: string[]; sourceUrl: string; closeIdx: number; fields?: string[] }
     | null = null;
 
   for (const mon of tryMonths) {
@@ -868,7 +991,7 @@ async function getTwseCloseForDateOrPrev(stockNo: string, targetYmd: string) {
       const rowYmd = parseTwseRowDateToISO(row?.[0]);
       if (!rowYmd) continue;
       if (rowYmd <= targetYmd) {
-        if (!best || rowYmd > best.ymd) best = { ymd: rowYmd, row, sourceUrl: url, fields, closeIdx };
+        if (!best || rowYmd > best.ymd) best = { ymd: rowYmd, row, sourceUrl: url, closeIdx, fields };
       }
     }
   }
@@ -886,6 +1009,7 @@ async function getTwseCloseForDateOrPrev(stockNo: string, targetYmd: string) {
 }
 
 /** ==================== MIS 即時報價 ==================== */
+
 type MisMsg = {
   c?: string;
   n?: string;
@@ -968,7 +1092,8 @@ async function fetchMisQuote(stockNo: string): Promise<{ market: "tse" | "otc"; 
   return null;
 }
 
-/** ==================== Yahoo（JSON，不爬 HTML） ==================== */
+/** ==================== Yahoo Chart（JSON，不爬 HTML） ==================== */
+
 type YahooQuote = {
   symbol: string;
   regularMarketPrice: number | null;
@@ -996,10 +1121,7 @@ async function fetchYahooQuoteForSymbol(symbol: string): Promise<YahooQuote | nu
   const res = await fetch(url, {
     method: "GET",
     cache: "no-store",
-    headers: {
-      "User-Agent": "Mozilla/5.0",
-      Accept: "application/json,text/plain,*/*",
-    },
+    headers: { "User-Agent": "Mozilla/5.0", Accept: "application/json,text/plain,*/*" },
   });
 
   if (!res.ok) return null;
@@ -1009,19 +1131,12 @@ async function fetchYahooQuoteForSymbol(symbol: string): Promise<YahooQuote | nu
 
   const price = toNumberMaybe(meta?.regularMarketPrice);
   const t = toNumberMaybe(meta?.regularMarketTime);
-  return {
-    symbol,
-    regularMarketPrice: price,
-    regularMarketTime: t != null ? Number(t) : null,
-    sourceUrl: url,
-  };
+  return { symbol, regularMarketPrice: price, regularMarketTime: t != null ? Number(t) : null, sourceUrl: url };
 }
 
 async function fetchYahooQuote(stockNo: string, hintMarket?: "tse" | "otc"): Promise<YahooQuote | null> {
-  // 上市：.TW，上櫃：.TWO（Yahoo 慣例）
-  const candidates: string[] = hintMarket === "otc"
-    ? [`${stockNo}.TWO`, `${stockNo}.TW`]
-    : [`${stockNo}.TW`, `${stockNo}.TWO`];
+  const candidates: string[] =
+    hintMarket === "otc" ? [`${stockNo}.TWO`, `${stockNo}.TW`] : [`${stockNo}.TW`, `${stockNo}.TWO`];
 
   for (const sym of candidates) {
     const q = await fetchYahooQuoteForSymbol(sym);
@@ -1030,7 +1145,8 @@ async function fetchYahooQuote(stockNo: string, hintMarket?: "tse" | "otc"): Pro
   return null;
 }
 
-/** ==================== OpenAI 回答抽取 ==================== */
+/** ==================== OpenAI web search（非股價類） ==================== */
+
 function extractOutputTextFromResponses(resp: any): string {
   if (typeof resp?.output_text === "string" && resp.output_text.trim()) return resp.output_text.trim();
   let text = "";
@@ -1073,6 +1189,7 @@ function extractUrlCitationsFromChat(resp: any): UrlCitation[] {
 }
 
 /** ==================== Main ==================== */
+
 export async function POST(req: Request) {
   try {
     const apiKey = process.env.OPENAI_API_KEY;
@@ -1089,23 +1206,35 @@ export async function POST(req: Request) {
     const taipeiNow = taipei.iso;
 
     // =========================================================
-    // ✅ 1) 台股：即時優先（MIS→Yahoo），收盤/歷史用（日資料）
+    // ✅ 台股股價：B方案（沒代號 → Yahoo Search 解析 → MIS即時 / TWSE收盤）
     // =========================================================
-    const stockNo = inferTwseStockNo(query);
-    const looksLikePrice = isPriceQuery(query);
+    const wantsPrice = isPriceQuery(query) || isRealtimeIntent(query);
 
-    if (stockNo && (looksLikePrice || isRealtimeIntent(query))) {
+    let stockNo = inferTwseStockNo(query);
+    let marketHint: "tse" | "otc" | undefined;
+    let resolverCitation: UrlCitation | null = null;
+    let resolvedSymbol: string | null = null;
+    let resolvedName: string | null = null;
+
+    if (!stockNo && wantsPrice) {
+      const resolved = await resolveTwStockFromYahoo(query).catch(() => null);
+      if (resolved?.stockNo) {
+        stockNo = resolved.stockNo;
+        marketHint = resolved.marketHint;
+        resolvedSymbol = resolved.yahooSymbol;
+        resolvedName = resolved.displayName || null;
+        resolverCitation = { title: `Yahoo Finance Search（解析台股代號）${resolved.yahooSymbol}`, url: resolved.sourceUrl };
+      }
+    }
+
+    if (stockNo && wantsPrice) {
       const parsed = parseDateFromQuery(query, Number(taipei.ymd.slice(0, 4)));
-
       const afterCloseLikely = taipei.hour > 14 || (taipei.hour === 14 && taipei.minute >= 5);
-      const wantsRealtime = isRealtimeIntent(query);
 
       const wantsCloseOrHistory =
-        /收盤|收盤價|close|日k|歷史|昨天|上週|上個月/i.test(query) ||
-        !!parsed?.explicit ||
-        (afterCloseLikely && mentionsToday(query) && !wantsRealtime);
+        /收盤|收盤價|close|日k|歷史|昨天|上週|上個月/i.test(query) || !!parsed?.explicit || (afterCloseLikely && mentionsToday(query) && !isRealtimeIntent(query));
 
-      // --- A) 收盤/歷史：TWSE 日資料 ---
+      // ---------- 收盤/歷史：TWSE ----------
       if (wantsCloseOrHistory) {
         const targetYmd = parsed?.ymd ?? taipei.ymd;
         try {
@@ -1113,95 +1242,95 @@ export async function POST(req: Request) {
           if (twse?.close != null) {
             const sameDay = twse.ymd === targetYmd;
 
-            // 如果今天的收盤還沒更新到日資料：補 MIS/Yahoo 即時
+            // 若今天日資料未更新：補 MIS/Yahoo 即時（可讀性更好）
             if (!sameDay && targetYmd === taipei.ymd && mentionsToday(query)) {
               const mis = await fetchMisQuote(stockNo).catch(() => null);
-              const yahoo = await fetchYahooQuote(stockNo, mis?.market).catch(() => null);
+              const yahoo = await fetchYahooQuote(stockNo, marketHint ?? mis?.market).catch(() => null);
 
-              const lastMis = mis?.msg ? toNumberMaybe(mis.msg.z) : null;
+              const misLast = mis?.msg ? toNumberMaybe(mis.msg.z) : null;
               const misTs = mis?.msg ? formatMisDatetime(mis.msg.d, mis.msg.t) : null;
               const yPrice = yahoo?.regularMarketPrice ?? null;
               const yTs = yahoo?.regularMarketTime != null ? epochToTaipei(yahoo.regularMarketTime) : null;
 
               const answer =
                 `台北時間基準：${taipeiNow}\n\n` +
-                `查詢代號：${stockNo}.TW\n` +
+                `查詢：${stockNo}.TW${resolvedSymbol ? `（由 ${resolvedSymbol}${resolvedName ? ` / ${resolvedName}` : ""} 解析）` : ""}\n` +
                 `⚠️ TWSE（日資料）尚未提供 ${targetYmd} 的官方收盤資料（可能尚未更新/非交易日）。\n` +
-                `目前 TWSE 最新可得交易日：${twse.ymd} 官方收盤價：${twse.close} TWD\n` +
+                `TWSE 最新可得交易日：${twse.ymd} 官方收盤價：${twse.close} TWD\n` +
                 `（開/高/低：${twse.open ?? "—"} / ${twse.high ?? "—"} / ${twse.low ?? "—"}）\n` +
                 (twse.volume != null ? `成交股數：${twse.volume}\n` : "") +
-                (lastMis != null ? `\n補充：MIS 最新成交價：${lastMis} TWD（更新：${misTs ?? "—"}）` : "") +
+                (misLast != null ? `\n補充：MIS 最新成交價：${misLast} TWD（更新：${misTs ?? "—"}）` : "") +
                 (yPrice != null ? `\n補充：Yahoo 最新價格：${yPrice} TWD（更新：${yTs ?? "—"}）` : "");
 
-              const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl }];
-              if (mis?.url && lastMis != null) citations.push({ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis.url });
+              const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（收盤/歷史）`, url: twse.sourceUrl }];
+              if (resolverCitation) citations.push(resolverCitation);
+              if (mis?.url && misLast != null) citations.push({ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis.url });
               if (yahoo?.sourceUrl && yPrice != null) citations.push({ title: `Yahoo Finance Chart ${yahoo.symbol}`, url: yahoo.sourceUrl });
 
               return Response.json({
                 answer,
-                citations,
-                meta: { query, mode: "twse_stock_day_not_ready_today", stockNo, targetYmd, resolvedYmd: twse.ymd, taipeiNow },
+                citations: citations.slice(0, 10),
+                meta: { query, mode: "twse_stock_day_not_ready_today", stockNo, targetYmd, resolvedYmd: twse.ymd, taipeiNow, resolvedSymbol, resolvedName },
               });
             }
 
             const answer =
               `台北時間基準：${taipeiNow}\n\n` +
-              `查詢代號：${stockNo}.TW\n` +
+              `查詢：${stockNo}.TW${resolvedSymbol ? `（由 ${resolvedSymbol}${resolvedName ? ` / ${resolvedName}` : ""} 解析）` : ""}\n` +
               (sameDay
                 ? `✅ ${twse.ymd} 官方收盤價（TWSE 日資料）：${twse.close} TWD`
                 : `✅ ${twse.ymd} 官方收盤價（TWSE 日資料）：${twse.close} TWD（找不到 ${targetYmd}，已取最近可得交易日）`) +
               `\n（開/高/低：${twse.open ?? "—"} / ${twse.high ?? "—"} / ${twse.low ?? "—"}）` +
               (twse.volume != null ? `\n成交股數：${twse.volume}` : "");
 
+            const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（收盤/歷史）`, url: twse.sourceUrl }];
+            if (resolverCitation) citations.push(resolverCitation);
+
             return Response.json({
               answer,
-              citations: [{ title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl }],
-              meta: { query, mode: "twse_stock_day", stockNo, taipeiNow },
+              citations: citations.slice(0, 10),
+              meta: { query, mode: "twse_stock_day", stockNo, taipeiNow, resolvedSymbol, resolvedName },
             });
           }
         } catch {
-          // continue to realtime
+          // fallback to realtime
         }
       }
 
-      // --- B) 即時：MIS →（若空值/落後）→ Yahoo JSON ---
+      // ---------- 即時：MIS → stale/空值 → Yahoo chart ----------
       const mis = await fetchMisQuote(stockNo).catch(() => null);
       const misMsg = mis?.msg;
       const misLast = misMsg ? toNumberMaybe(misMsg.z) : null;
       const misEpoch = misMsg ? misToEpochMs(misMsg.d, misMsg.t) : null;
 
-      // MIS 看起來落後就用 Yahoo（你可以調這個門檻）
       const STALE_MS = 5 * 60 * 1000;
       const nowMs = Date.now();
       const misIsStale = misEpoch != null ? nowMs - misEpoch > STALE_MS : true;
 
-      // 若 MIS 沒價 或 明顯落後 → 用 Yahoo
       if (misLast == null || misIsStale) {
-        const yahoo = await fetchYahooQuote(stockNo, mis?.market).catch(() => null);
+        const yahoo = await fetchYahooQuote(stockNo, marketHint ?? mis?.market).catch(() => null);
         if (yahoo?.regularMarketPrice != null) {
           const yTs = yahoo.regularMarketTime != null ? epochToTaipei(yahoo.regularMarketTime) : null;
 
           const answer =
             `台北時間基準：${taipeiNow}\n\n` +
-            `查詢代號：${stockNo}.TW\n` +
+            `查詢：${stockNo}.TW${resolvedSymbol ? `（由 ${resolvedSymbol}${resolvedName ? ` / ${resolvedName}` : ""} 解析）` : ""}\n` +
             `即時價格：${yahoo.regularMarketPrice} TWD\n` +
             (yTs ? `更新時間：${yTs}（來源：Yahoo Finance）\n` : `來源：Yahoo Finance\n`) +
-            (misLast != null
-              ? `\n（補充：MIS 回傳 ${misLast}，但時間戳較舊，已改用 Yahoo。）`
-              : `\n（補充：MIS 暫無有效即時成交價，已改用 Yahoo。）`);
+            (misLast != null ? `\n（補充：MIS 回傳 ${misLast}，但時間戳較舊，已改用 Yahoo。）` : `\n（補充：MIS 暫無有效即時成交價，已改用 Yahoo。）`);
 
           const citations: UrlCitation[] = [{ title: `Yahoo Finance Chart ${yahoo.symbol}`, url: yahoo.sourceUrl }];
+          if (resolverCitation) citations.push(resolverCitation);
           if (mis?.url) citations.push({ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis.url });
 
           return Response.json({
             answer,
-            citations,
-            meta: { query, mode: "realtime_yahoo_fallback", stockNo, taipeiNow, yahoo_symbol: yahoo.symbol, yahoo_time: yTs },
+            citations: citations.slice(0, 10),
+            meta: { query, mode: "realtime_yahoo_fallback", stockNo, taipeiNow, resolvedSymbol, resolvedName, yahoo_symbol: yahoo.symbol, yahoo_time: yTs },
           });
         }
       }
 
-      // MIS 正常就用 MIS
       if (misMsg) {
         const yclose = toNumberMaybe(misMsg.y);
         const open = toNumberMaybe(misMsg.o);
@@ -1212,32 +1341,38 @@ export async function POST(req: Request) {
 
         const answer =
           `台北時間基準：${taipeiNow}\n\n` +
-          `查詢代號：${stockNo}.TW（${mis?.market === "otc" ? "上櫃" : "上市"}）\n` +
+          `查詢：${stockNo}.TW${resolvedSymbol ? `（由 ${resolvedSymbol}${resolvedName ? ` / ${resolvedName}` : ""} 解析）` : ""}\n` +
           `即時價格：${misLast ?? yclose ?? "—"} TWD\n` +
           (ts ? `更新時間：${ts}（來源：TWSE MIS）\n` : "") +
           `昨收：${yclose ?? "—"}｜開：${open ?? "—"}｜高：${high ?? "—"}｜低：${low ?? "—"}｜量：${vol ?? "—"}`;
 
+        const citations: UrlCitation[] = [{ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis.url }];
+        if (resolverCitation) citations.push(resolverCitation);
+
         return Response.json({
           answer,
-          citations: [{ title: `TWSE MIS 即時報價 ${stockNo}`, url: mis!.url }],
-          meta: { query, mode: "realtime_mis", stockNo, taipeiNow, mis_datetime: ts },
+          citations: citations.slice(0, 10),
+          meta: { query, mode: "realtime_mis", stockNo, taipeiNow, resolvedSymbol, resolvedName, mis_datetime: ts, market: mis.market },
         });
       }
 
-      // 最後 fallback：日資料（至少回得出）
+      // 最後 fallback：TWSE 日資料
       try {
         const twse = await getTwseCloseForDateOrPrev(stockNo, taipei.ymd);
         if (twse?.close != null) {
           const answer =
             `台北時間基準：${taipeiNow}\n\n` +
-            `查詢代號：${stockNo}.TW\n` +
+            `查詢：${stockNo}.TW${resolvedSymbol ? `（由 ${resolvedSymbol}${resolvedName ? ` / ${resolvedName}` : ""} 解析）` : ""}\n` +
             `⚠️ 即時報價來源暫不可用，先提供 TWSE 日資料（官方收盤/歷史）。\n` +
             `最新可得交易日：${twse.ymd} 官方收盤價：${twse.close} TWD`;
 
+          const citations: UrlCitation[] = [{ title: `TWSE STOCK_DAY ${stockNo}（收盤/歷史）`, url: twse.sourceUrl }];
+          if (resolverCitation) citations.push(resolverCitation);
+
           return Response.json({
             answer,
-            citations: [{ title: `TWSE STOCK_DAY ${stockNo}（含收盤價）`, url: twse.sourceUrl }],
-            meta: { query, mode: "fallback_stock_day", stockNo, taipeiNow },
+            citations: citations.slice(0, 10),
+            meta: { query, mode: "fallback_stock_day", stockNo, taipeiNow, resolvedSymbol, resolvedName },
           });
         }
       } catch {
@@ -1246,7 +1381,7 @@ export async function POST(req: Request) {
     }
 
     // =========================================================
-    // ✅ 2) 其他 query 才走 gpt-4o-search-preview / Responses
+    // ✅ 其他 query：走 OpenAI web_search
     // =========================================================
     const model = process.env.WEB_SEARCH_MODEL || "gpt-4o-mini";
     const isSearchPreviewModel = /-search-(preview|api)\b/i.test(model);
@@ -1325,6 +1460,7 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
 }
+
 
 
 
