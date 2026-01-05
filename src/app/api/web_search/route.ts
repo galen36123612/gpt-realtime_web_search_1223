@@ -1431,7 +1431,8 @@ export async function POST(req: Request) {
   } catch (e: any) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
-}
+}*/
+
 // 0105 websearch + 基本面 + 技術面
 
 // src/app/api/web_search/route.ts
