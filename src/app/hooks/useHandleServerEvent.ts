@@ -790,7 +790,7 @@ export function useHandleServerEvent({
           addTranscriptMessage(
             "welcome",
             "assistant",
-            "你好！這裡是行天宮解籤服務！你抽到的是幾號籤？"
+            "你好！你想了解鴻海(2317)或台積電(2330)這兩支股票？"
           );
         }
         break;
