@@ -2454,13 +2454,44 @@ function calcChange(last: number | null, prevClose: number | null) {
   return { chg, pct };
 }
 
-/** 台股 volume 通常是股數；顯示成 張 + 股 */
-function formatTaiwanVolume(volumeShares: number | null) {
-  if (volumeShares == null) return null;
-  const lots = Math.round(volumeShares / 1000);
-  const lotsStr = lots.toLocaleString("en-US");
-  const sharesStr = Math.round(volumeShares).toLocaleString("en-US");
-  return `${lotsStr} 張（${sharesStr} 股）`;
+/**
+ * ✅ 成交量格式化：一律用「張」顯示
+ * - unit="lots": 來源是「張」（MIS）
+ * - unit="shares": 來源是「股」（TWSE STOCK_DAY / Yahoo）
+ */
+function formatTaiwanVolume(volume: number | null, unit: "lots" | "shares" = "shares") {
+  if (volume == null) return null;
+
+  if (unit === "lots") {
+    return `${Math.round(volume).toLocaleString("en-US")} 張`;
+  }
+
+  const lots = volume / 1000;
+  const lotsText =
+    Number.isInteger(lots) ? lots.toLocaleString("en-US") : lots.toFixed(3).replace(/\.?0+$/, "");
+  return `${lotsText} 張`;
+}
+
+/**
+ * ✅ 沒成交價時，用買賣報價推估漲跌幅（避免 chgLine 變空）
+ * - 有 last：用 last
+ * - 有 bid+ask：用中間價
+ * - 只有 bid 或 ask：用該價
+ */
+function pickIndicativePriceForChange(input: {
+  last: number | null;
+  bestBid: number | null;
+  bestAsk: number | null;
+}): { price: number; label: string } | null {
+  if (input.last != null) return { price: input.last, label: "最新成交" };
+
+  if (input.bestBid != null && input.bestAsk != null) {
+    return { price: (input.bestBid + input.bestAsk) / 2, label: "買賣中間價（尚未成交）" };
+  }
+  if (input.bestBid != null) return { price: input.bestBid, label: "最佳買價（尚未成交）" };
+  if (input.bestAsk != null) return { price: input.bestAsk, label: "最佳賣價（尚未成交）" };
+
+  return null;
 }
 
 /**
@@ -2702,8 +2733,8 @@ async function fetchTwseMisRealtime(code: string) {
   const bestBid = bid.length ? bid[0] : null;
   const bestAsk = ask.length ? ask[0] : null;
 
-  // ✅ 累積成交量（股數）
-  const volumeShares = toNumberMaybe(pick?.v) ?? toNumberMaybe(pick?.tv) ?? null;
+  // ✅ 你的實測：MIS v/tv 是「張」
+  const volumeLots = toNumberMaybe(pick?.v) ?? toNumberMaybe(pick?.tv) ?? null;
 
   const name = (pick?.n || pick?.nf || pick?.name || "").toString().trim() || undefined;
   const time = (pick?.t || "").toString().trim();
@@ -2717,7 +2748,7 @@ async function fetchTwseMisRealtime(code: string) {
     low,
     bestBid,
     bestAsk,
-    volumeShares,
+    volumeLots,
     name,
     rawTime: time,
     rawDate: date,
@@ -2840,7 +2871,7 @@ async function getTwseCloseForDateOrPrev(stockNo: string, targetYmd: string) {
   const high = toNumberMaybe(row?.[4]);
   const low = toNumberMaybe(row?.[5]);
   const close = toNumberMaybe(row?.[best.closeIdx]);
-  const volume = toNumberMaybe(row?.[1]); // 成交股數
+  const volume = toNumberMaybe(row?.[1]); // 成交股數（股）
 
   return { ymd: best.ymd, open, high, low, close, volume, sourceUrl: best.sourceUrl };
 }
@@ -2980,7 +3011,7 @@ export async function POST(req: Request) {
 
             const chg = calcChange(twse.close, prevClose2);
             const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
-            const volLine = twse.volume != null ? `\n成交量：${formatTaiwanVolume(twse.volume)}` : "";
+            const volLine = twse.volume != null ? `\n成交量：${formatTaiwanVolume(twse.volume, "shares")}` : "";
 
             const sameDay = twse.ymd === targetYmd;
             const answer =
@@ -3020,7 +3051,7 @@ export async function POST(req: Request) {
               const t = formatTaipeiTimeFromEpoch(yq.marketTimeEpochSec);
               const chg = calcChange(yq.price, yq.prevClose);
               const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
-              const volLine = yq.volume != null ? `\n成交量：${formatTaiwanVolume(yq.volume)}` : "";
+              const volLine = yq.volume != null ? `\n成交量：${formatTaiwanVolume(yq.volume, "shares")}` : "";
 
               const answer =
                 `台北時間基準：${taipeiNow}\n` +
@@ -3065,15 +3096,20 @@ export async function POST(req: Request) {
               }
 
               let prevClose: number | null = mis2?.prevClose ?? null;
-              let volumeShares: number | null = mis2?.volumeShares ?? null;
-              const misUrl: string | undefined = mis2?.sourceUrl; // ✅ prefer-const 修正
 
-              // MIS 失敗則用 Yahoo 補
-              if (prevClose == null || volumeShares == null) {
+              // 成交量：MIS 是 lots；Yahoo 是 shares（備援）
+              let volumeValue: number | null = mis2?.volumeLots ?? null;
+              let volumeUnit: "lots" | "shares" = "lots";
+              const misUrl: string | undefined = mis2?.sourceUrl;
+
+              if (prevClose == null || volumeValue == null) {
                 try {
                   const yq = await fetchYahooQuote(finalSymbol!);
                   if (prevClose == null) prevClose = yq?.prevClose ?? null;
-                  if (volumeShares == null) volumeShares = yq?.volume ?? null;
+                  if (volumeValue == null) {
+                    volumeValue = yq?.volume ?? null;
+                    volumeUnit = "shares";
+                  }
                 } catch {
                   // ignore
                 }
@@ -3081,10 +3117,13 @@ export async function POST(req: Request) {
 
               const chg = calcChange(wg.picked.price, prevClose);
               const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
-              const volLine = volumeShares != null ? `\n成交量（累積）：${formatTaiwanVolume(volumeShares)}` : "";
+              const volLine =
+                volumeValue != null ? `\n成交量（累積）：${formatTaiwanVolume(volumeValue, volumeUnit)}` : "";
 
               const headerLine =
-                volumeLike && !priceLike ? `✅ 成交量（累積）：${formatTaiwanVolume(volumeShares) ?? "—"}` : `✅ 最新價格：${wg.picked.price} TWD`;
+                volumeLike && !priceLike
+                  ? `✅ 成交量（累積）：${formatTaiwanVolume(volumeValue, volumeUnit) ?? "—"}`
+                  : `✅ 最新價格：${wg.picked.price} TWD`;
 
               const answer =
                 `台北時間基準：${taipeiNow}\n` +
@@ -3123,22 +3162,27 @@ export async function POST(req: Request) {
             mis.bestBid != null ||
             mis.bestAsk != null ||
             mis.prevClose != null ||
-            mis.volumeShares != null)
+            mis.volumeLots != null)
         ) {
-          const hasTrade = mis.last != null;
+          const ref = pickIndicativePriceForChange({
+            last: mis.last,
+            bestBid: mis.bestBid,
+            bestAsk: mis.bestAsk,
+          });
+
           const bestLine =
             mis.bestBid != null || mis.bestAsk != null ? `\n最佳買/賣：${mis.bestBid ?? "—"} / ${mis.bestAsk ?? "—"}` : "";
 
-          const chg = calcChange(mis.last, mis.prevClose);
+          const chg = calcChange(ref?.price ?? null, mis.prevClose);
           const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
-          const volLine = mis.volumeShares != null ? `\n成交量（累積）：${formatTaiwanVolume(mis.volumeShares)}` : "";
+          const volLine = mis.volumeLots != null ? `\n成交量（累積）：${formatTaiwanVolume(mis.volumeLots, "lots")}` : "";
 
           const mainLine =
             volumeLike && !priceLike
-              ? `✅ 成交量（累積）：${formatTaiwanVolume(mis.volumeShares) ?? "—"}`
-              : hasTrade
-              ? `✅ 最新成交（TWSE MIS）：${mis.last} TWD`
-              : `⚠️ 目前尚未有「成交價」回傳（可能尚未撮合），改提供買賣報價/參考價`;
+              ? `✅ 成交量（累積）：${formatTaiwanVolume(mis.volumeLots, "lots") ?? "—"}`
+              : ref
+              ? `✅ ${ref.label}（TWSE MIS）：${ref.price} TWD`
+              : `⚠️ 目前無成交/無報價，暫無法推估漲跌`;
 
           const answer =
             `台北時間基準：${taipeiNow}\n` +
@@ -3169,10 +3213,10 @@ export async function POST(req: Request) {
             const t = formatTaipeiTimeFromEpoch(yq.marketTimeEpochSec);
             const chg = calcChange(yq.price, yq.prevClose);
             const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
-            const volLine = yq.volume != null ? `\n成交量：${formatTaiwanVolume(yq.volume)}` : "";
+            const volLine = yq.volume != null ? `\n成交量：${formatTaiwanVolume(yq.volume, "shares")}` : "";
 
             const mainLine =
-              volumeLike && !priceLike ? `✅ 成交量：${formatTaiwanVolume(yq.volume) ?? "—"}` : `✅ 最新價格（Yahoo）：${yq.price ?? "—"}`;
+              volumeLike && !priceLike ? `✅ 成交量：${formatTaiwanVolume(yq.volume, "shares") ?? "—"}` : `✅ 最新價格（Yahoo）：${yq.price ?? "—"}`;
 
             const answer =
               `台北時間基準：${taipeiNow}\n` +
@@ -3201,7 +3245,7 @@ export async function POST(req: Request) {
         try {
           const twse = await getTwseCloseForDateOrPrev(finalCode!, taipei.ymd);
           if (twse?.close != null) {
-            const volLine = twse.volume != null ? `\n成交量：${formatTaiwanVolume(twse.volume)}` : "";
+            const volLine = twse.volume != null ? `\n成交量：${formatTaiwanVolume(twse.volume, "shares")}` : "";
             const answer =
               `台北時間基準：${taipeiNow}\n` +
               `代號：${finalCode}（${finalSymbol}）\n` +
@@ -3335,6 +3379,7 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
 }
+
 
 
 
