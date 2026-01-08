@@ -2526,7 +2526,7 @@ async function yahooSearchTaiwanSymbol(userQuery: string): Promise<{ symbol: str
   return { symbol: String(picked.symbol), shortname: picked.shortname || picked.longname };
 }
 
-/** ===== wantgoo：用 XHR API 抓「盤中逐筆/最新成交」 ===== */
+/** ===== wantgoo：XHR API 抓「最新成交」 ===== */
 
 function deepPickNumberByKey(root: any, keyMatchers: RegExp[]): number | null {
   const seen = new Set<any>();
@@ -2638,7 +2638,7 @@ async function fetchTwseMisRealtime(code: string) {
 
   const pick = arr.find((it) => toNumberMaybe(it?.y) != null) || arr[0];
 
-  const last = toNumberMaybe(pick?.z); // 最新成交
+  const last = toNumberMaybe(pick?.z);
   const prevClose = toNumberMaybe(pick?.y);
   const open = toNumberMaybe(pick?.o);
   const high = toNumberMaybe(pick?.h);
@@ -2649,7 +2649,7 @@ async function fetchTwseMisRealtime(code: string) {
   const bestBid = bid.length ? bid[0] : null;
   const bestAsk = ask.length ? ask[0] : null;
 
-  // ✅ 成交量（累積），通常是股數
+  // ✅ 成交量（累積股數）
   const volumeShares = toNumberMaybe(pick?.v) ?? toNumberMaybe(pick?.tv) ?? null;
 
   const name = (pick?.n || pick?.nf || pick?.name || "").toString().trim() || undefined;
@@ -2664,7 +2664,7 @@ async function fetchTwseMisRealtime(code: string) {
     low,
     bestBid,
     bestAsk,
-    volumeShares, // ✅
+    volumeShares,
     name,
     rawTime: time,
     rawDate: date,
@@ -2694,7 +2694,7 @@ async function fetchYahooQuote(symbol: string) {
   const open = typeof r?.regularMarketOpen === "number" ? r.regularMarketOpen : null;
   const high = typeof r?.regularMarketDayHigh === "number" ? r.regularMarketDayHigh : null;
   const low = typeof r?.regularMarketDayLow === "number" ? r.regularMarketDayLow : null;
-  const volume = typeof r?.regularMarketVolume === "number" ? r.regularMarketVolume : null; // ✅
+  const volume = typeof r?.regularMarketVolume === "number" ? r.regularMarketVolume : null;
   const name = (r?.shortName || r?.longName || "").toString().trim() || undefined;
 
   const t = typeof r?.regularMarketTime === "number" ? r.regularMarketTime : null;
@@ -2881,8 +2881,6 @@ export async function POST(req: Request) {
 
     const volumeLike = looksLikeVolumeQuery(query);
     const priceLike = looksLikePriceQuery(query) || isRealtimeIntent(query) || isCloseIntent(query);
-
-    // ✅ 只要是價或量都走台股資料分支
     const needsTaiwanMarketData = priceLike || volumeLike;
 
     const fromMap = inferFromNameMap(query);
@@ -2890,10 +2888,9 @@ export async function POST(req: Request) {
 
     let finalSymbol: string | null = null;
 
-    // 若只有名稱（例如「鴻海交易量」），用 Yahoo search 補 symbol/code
     if (needsTaiwanMarketData) {
       if (finalCode) {
-        finalSymbol = `${finalCode}.TW`; // 先假設 TW；若 Yahoo search 找到會覆蓋
+        finalSymbol = `${finalCode}.TW`;
       } else {
         const s = await yahooSearchTaiwanSymbol(query);
         if (s?.symbol) {
@@ -2910,7 +2907,6 @@ export async function POST(req: Request) {
       if (dateInQuery?.explicit || isCloseIntent(query)) {
         let targetYmd = dateInQuery?.ymd ?? taipei.ymd;
 
-        // 問「今天收盤」但尚未收盤後（約 13:30，留 5 分鐘緩衝）→ 先看前一交易日
         const afterCloseLikely = taipei.hour > 13 || (taipei.hour === 13 && taipei.minute >= 35);
         if (!dateInQuery?.explicit && isCloseIntent(query) && !afterCloseLikely) {
           targetYmd = addDaysToYMD(taipei.ymd, -1);
@@ -2928,9 +2924,9 @@ export async function POST(req: Request) {
             } catch {
               prevClose2 = null;
             }
+
             const chg = calcChange(twse.close, prevClose2);
             const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
-
             const volLine = twse.volume != null ? `\n成交量：${formatTaiwanVolume(twse.volume)}` : "";
 
             const sameDay = twse.ymd === targetYmd;
@@ -2964,10 +2960,10 @@ export async function POST(req: Request) {
             });
           }
         } catch {
-          // STOCK_DAY 失敗 → Yahoo prevClose/volume fallback（會明講）
+          // STOCK_DAY 失敗 → Yahoo fallback
           try {
             const yq = await fetchYahooQuote(finalSymbol!);
-            if (yq?.prevClose != null || yq?.price != null) {
+            if (yq?.prevClose != null || yq?.price != null || yq?.volume != null) {
               const t = formatTaipeiTimeFromEpoch(yq.marketTimeEpochSec);
               const chg = calcChange(yq.price, yq.prevClose);
               const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
@@ -2994,14 +2990,15 @@ export async function POST(req: Request) {
             // ignore
           }
         }
-        // 若都失敗，最後才進 web_search（下面會處理）
       } else {
         // 1b) 即時（或要當天成交量）：wantgoo（價）→ MIS（價/量/昨收）→ Yahoo（備援）
         const realtimePrefer =
-          isRealtimeIntent(query) || (looksLikePriceQuery(query) && !isCloseIntent(query) && !dateInQuery?.explicit) || volumeLike;
+          isRealtimeIntent(query) ||
+          (looksLikePriceQuery(query) && !isCloseIntent(query) && !dateInQuery?.explicit) ||
+          volumeLike;
 
         if (realtimePrefer) {
-          // wantgoo 先嘗試抓價（你要的行為）
+          // wantgoo 先嘗試抓價
           try {
             const wg = await fetchWantgooRealtimePrice(finalCode!, taipei.ymd);
 
@@ -3014,9 +3011,9 @@ export async function POST(req: Request) {
                 mis2 = null;
               }
 
-              let prevClose = mis2?.prevClose ?? null;
-              let volumeShares = mis2?.volumeShares ?? null;
-              let misUrl = mis2?.sourceUrl;
+              let prevClose: number | null = mis2?.prevClose ?? null;
+              let volumeShares: number | null = mis2?.volumeShares ?? null;
+              const misUrl: string | undefined = mis2?.sourceUrl; // ✅ 修正 prefer-const
 
               // MIS 失敗則用 Yahoo 補
               if (prevClose == null || volumeShares == null) {
@@ -3033,15 +3030,16 @@ export async function POST(req: Request) {
               const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
               const volLine = volumeShares != null ? `\n成交量（累積）：${formatTaiwanVolume(volumeShares)}` : "";
 
-              // ✅ 若使用者只問成交量，就讓成交量更突出；仍可附上價作參考
-              const headerLine = volumeLike && !priceLike ? `✅ 成交量（累積）：${formatTaiwanVolume(volumeShares) ?? "—"}` : `✅ 最新價格：${wg.picked.price} TWD`;
+              // ✅ 若只問成交量：主行回成交量（仍用 wantgoo 價格當備援但不一定顯示）
+              const headerLine =
+                volumeLike && !priceLike ? `✅ 成交量（累積）：${formatTaiwanVolume(volumeShares) ?? "—"}` : `✅ 最新價格：${wg.picked.price} TWD`;
 
               const answer =
                 `台北時間基準：${taipeiNow}\n` +
                 `代號：${finalCode}（${finalSymbol}）${fromMap?.name ? `（${fromMap.name}）` : ""}\n` +
                 headerLine +
                 (!volumeLike || priceLike ? (prevClose != null ? `\n前一交易日收盤：${prevClose} TWD` : "") + chgLine : "") +
-                (!volumeLike || priceLike ? volLine : volLine) +
+                volLine +
                 (wg.picked.time ? `\n資料時間（wantgoo）：${wg.picked.time}` : "") +
                 `\n（註：報價/成交量可能延遲；若需完全即時請以券商/交易所為準）`;
 
@@ -3055,11 +3053,11 @@ export async function POST(req: Request) {
               });
             }
           } catch {
-            // wantgoo 被擋 / 解析不到 → 繼續 MIS
+            // wantgoo 失敗 → 繼續 MIS
           }
         }
 
-        // TWSE MIS（官方盤中）
+        // TWSE MIS（官方）
         let mis: Awaited<ReturnType<typeof fetchTwseMisRealtime>> | null = null;
         try {
           mis = await fetchTwseMisRealtime(finalCode!);
@@ -3067,7 +3065,14 @@ export async function POST(req: Request) {
           mis = null;
         }
 
-        if (mis && (mis.last != null || mis.bestBid != null || mis.bestAsk != null || mis.prevClose != null || mis.volumeShares != null)) {
+        if (
+          mis &&
+          (mis.last != null ||
+            mis.bestBid != null ||
+            mis.bestAsk != null ||
+            mis.prevClose != null ||
+            mis.volumeShares != null)
+        ) {
           const hasTrade = mis.last != null;
           const bestLine =
             mis.bestBid != null || mis.bestAsk != null ? `\n最佳買/賣：${mis.bestBid ?? "—"} / ${mis.bestAsk ?? "—"}` : "";
@@ -3076,7 +3081,6 @@ export async function POST(req: Request) {
           const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
           const volLine = mis.volumeShares != null ? `\n成交量（累積）：${formatTaiwanVolume(mis.volumeShares)}` : "";
 
-          // 若只問成交量：主行回成交量；否則主行回成交價
           const mainLine =
             volumeLike && !priceLike
               ? `✅ 成交量（累積）：${formatTaiwanVolume(mis.volumeShares) ?? "—"}`
@@ -3106,7 +3110,7 @@ export async function POST(req: Request) {
           });
         }
 
-        // Yahoo quote fallback（含成交量/漲跌%）
+        // Yahoo fallback（含成交量/漲跌%）
         try {
           const yq = await fetchYahooQuote(finalSymbol!);
           if (yq && (yq.price != null || yq.prevClose != null || yq.volume != null)) {
@@ -3116,9 +3120,7 @@ export async function POST(req: Request) {
             const volLine = yq.volume != null ? `\n成交量：${formatTaiwanVolume(yq.volume)}` : "";
 
             const mainLine =
-              volumeLike && !priceLike
-                ? `✅ 成交量：${formatTaiwanVolume(yq.volume) ?? "—"}`
-                : `✅ 最新價格（Yahoo）：${yq.price ?? "—"}`;
+              volumeLike && !priceLike ? `✅ 成交量：${formatTaiwanVolume(yq.volume) ?? "—"}` : `✅ 最新價格（Yahoo）：${yq.price ?? "—"}`;
 
             const answer =
               `台北時間基準：${taipeiNow}\n` +
@@ -3281,6 +3283,7 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
 }
+
 
 
 
