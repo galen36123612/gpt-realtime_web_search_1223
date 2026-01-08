@@ -2427,7 +2427,7 @@ function isRealtimeIntent(query: string): boolean {
   return yes && !isCloseIntent(query);
 }
 
-/** 技術分析意圖（先保留；你要穩定抓 ifa 指標，最好走它的 XHR API） */
+/** 技術分析意圖（先保留） */
 function isTechnicalAnalysisQuery(query: string): boolean {
   const q = query.toLowerCase();
   const kws = ["技術分析", "均線", "ma", "macd", "kd", "kdj", "rsi", "布林", "boll", "支撐", "壓力", "趨勢", "型態", "technical", "indicator"];
@@ -2616,17 +2616,70 @@ function parsePriceList(s: any): number[] {
     .filter((x): x is number => x != null);
 }
 
+/** 取 set-cookie（undici/Node 有時會是多個） */
+function getSetCookies(res: Response): string[] {
+  const h: any = res.headers as any;
+  const out: string[] = [];
+
+  if (typeof h.getSetCookie === "function") {
+    try {
+      const v = h.getSetCookie();
+      if (Array.isArray(v)) out.push(...v);
+    } catch {
+      // ignore
+    }
+  }
+
+  const single = res.headers.get("set-cookie");
+  if (single) out.push(single);
+
+  return out.filter(Boolean);
+}
+
+/** set-cookie -> Cookie header (name=value; name2=value2) */
+function toCookieHeader(setCookies: string[]): string | undefined {
+  const kv = setCookies
+    .map((sc) => String(sc).split(";")[0]?.trim())
+    .filter(Boolean);
+
+  if (!kv.length) return undefined;
+  return Array.from(new Set(kv)).join("; ");
+}
+
+/**
+ * ✅ MIS 常需要先打 fibest.jsp 建立 session cookie
+ * 否則 getStockInfo.jsp 可能回空 msgArray
+ */
 async function fetchTwseMisRealtime(code: string) {
+  const initUrl = `https://mis.twse.com.tw/stock/fibest.jsp?stockNo=${encodeURIComponent(code)}`;
+
+  const initRes = await fetch(initUrl, {
+    method: "GET",
+    cache: "no-store",
+    headers: {
+      "User-Agent": "Mozilla/5.0",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+      Referer: "https://mis.twse.com.tw/stock/fibest.jsp",
+    },
+  });
+
+  const cookieHeader = toCookieHeader(getSetCookies(initRes));
+
   const exCh = `tse_${code}.tw|otc_${code}.tw`;
-  const url = `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=${encodeURIComponent(exCh)}`;
+  const url =
+    `https://mis.twse.com.tw/stock/api/getStockInfo.jsp?json=1&delay=0&ex_ch=${encodeURIComponent(exCh)}` +
+    `&_=${Date.now()}`;
 
   const res = await fetch(url, {
     method: "GET",
     cache: "no-store",
     headers: {
       "User-Agent": "Mozilla/5.0",
-      Referer: "https://mis.twse.com.tw/stock/fibest.jsp",
+      Referer: initUrl,
       Accept: "application/json,text/plain,*/*",
+      "X-Requested-With": "XMLHttpRequest",
+      ...(cookieHeader ? { Cookie: cookieHeader } : {}),
     },
   });
 
@@ -2638,8 +2691,8 @@ async function fetchTwseMisRealtime(code: string) {
 
   const pick = arr.find((it) => toNumberMaybe(it?.y) != null) || arr[0];
 
-  const last = toNumberMaybe(pick?.z);
-  const prevClose = toNumberMaybe(pick?.y);
+  const last = toNumberMaybe(pick?.z); // 最新成交
+  const prevClose = toNumberMaybe(pick?.y); // 昨收
   const open = toNumberMaybe(pick?.o);
   const high = toNumberMaybe(pick?.h);
   const low = toNumberMaybe(pick?.l);
@@ -2649,7 +2702,7 @@ async function fetchTwseMisRealtime(code: string) {
   const bestBid = bid.length ? bid[0] : null;
   const bestAsk = ask.length ? ask[0] : null;
 
-  // ✅ 成交量（累積股數）
+  // ✅ 累積成交量（股數）
   const volumeShares = toNumberMaybe(pick?.v) ?? toNumberMaybe(pick?.tv) ?? null;
 
   const name = (pick?.n || pick?.nf || pick?.name || "").toString().trim() || undefined;
@@ -2998,7 +3051,7 @@ export async function POST(req: Request) {
           volumeLike;
 
         if (realtimePrefer) {
-          // wantgoo 先嘗試抓價
+          // wantgoo 先嘗試抓價（可被擋，失敗就往下走 MIS）
           try {
             const wg = await fetchWantgooRealtimePrice(finalCode!, taipei.ymd);
 
@@ -3013,7 +3066,7 @@ export async function POST(req: Request) {
 
               let prevClose: number | null = mis2?.prevClose ?? null;
               let volumeShares: number | null = mis2?.volumeShares ?? null;
-              const misUrl: string | undefined = mis2?.sourceUrl; // ✅ 修正 prefer-const
+              const misUrl: string | undefined = mis2?.sourceUrl; // ✅ prefer-const 修正
 
               // MIS 失敗則用 Yahoo 補
               if (prevClose == null || volumeShares == null) {
@@ -3030,7 +3083,6 @@ export async function POST(req: Request) {
               const chgLine = chg ? `\n漲跌：${formatSigned(chg.chg, 2)}（${formatSigned(chg.pct, 2)}%）` : "";
               const volLine = volumeShares != null ? `\n成交量（累積）：${formatTaiwanVolume(volumeShares)}` : "";
 
-              // ✅ 若只問成交量：主行回成交量（仍用 wantgoo 價格當備援但不一定顯示）
               const headerLine =
                 volumeLike && !priceLike ? `✅ 成交量（累積）：${formatTaiwanVolume(volumeShares) ?? "—"}` : `✅ 最新價格：${wg.picked.price} TWD`;
 
@@ -3057,7 +3109,7 @@ export async function POST(req: Request) {
           }
         }
 
-        // TWSE MIS（官方）
+        // ✅ TWSE MIS（官方）——現在會先 warmup cookie
         let mis: Awaited<ReturnType<typeof fetchTwseMisRealtime>> | null = null;
         try {
           mis = await fetchTwseMisRealtime(finalCode!);
@@ -3283,6 +3335,7 @@ export async function POST(req: Request) {
     return new Response(JSON.stringify({ error: String(e?.message || e) }), { status: 500 });
   }
 }
+
 
 
 
