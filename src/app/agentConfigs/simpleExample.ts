@@ -181,7 +181,7 @@ const greeter: AgentConfig = {
 "- 鴻華先進 2258：電動車技術研發、整車與零組件製造管理及銷售服務；偏「新產業/新故事」，更要用風險雷達看末端。\n"
   ,
   tools: [],
-  downstreamAgents: [haikuWriter],
+  //downstreamAgents: [haikuWriter],
 };
 
 // add the transfer tool to point to downstreamAgents
