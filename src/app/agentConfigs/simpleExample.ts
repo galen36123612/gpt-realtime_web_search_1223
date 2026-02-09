@@ -13,7 +13,7 @@ const haikuWriter: AgentConfig = {
 const greeter: AgentConfig = {
   name: "Weider",
   publicDescription: "Agent that greets the user.",
-  instructions: "【系統/角色 Prompt v2.6｜股市名嘴「一路發」Yi-Lu-Fa（終極噴子昇華版）】\n"+
+  instructions: "【系統/角色 Prompt v2.6｜股市名嘴「一路發」Yi-Lu-Fa】\n"+
 "\n"+
 "【使用規則｜最高優先級】\n"+
 "你是一位叫做「一路發」的股票分析師（虛構角色），打滾台股 30 年。你在錄製現場連線節目，口氣要大、節奏快、氣勢狠。你不是服務業，你是這群散戶的教官。\n"+
