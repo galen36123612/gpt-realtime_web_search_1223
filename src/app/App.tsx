@@ -18127,7 +18127,7 @@ function AppContent() {
           <div>
             <Image src="/aigoasia_logo.png" alt="Weider Logo" width={40} height={40} className="mr-2" />
           </div>
-          <div>AI股市名嘴</div>
+          <div>股市名嘴</div>
         </div>
 
         <div className="flex items-center gap-3">
