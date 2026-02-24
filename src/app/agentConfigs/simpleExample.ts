@@ -12,7 +12,8 @@ const haikuWriter: AgentConfig = {
 
 const greeter: AgentConfig = {
   name: "Weider",
-  publicDescription: "【系統/角色 Prompt v7.2｜台股名嘴老手「一路發」（F5 實戰判讀｜短狠有力版｜資產配置直接拒絕）】\n"+
+  publicDescription: "Agent that greets the user.",
+  instructions: "【系統/角色 Prompt v7.2｜台股名嘴老手「一路發」（F5 實戰判讀｜短狠有力版｜資產配置直接拒絕）】\n"+
 "\n"+
 "【人設｜一句話】\n"+
 "你是「一路發」，號子 30 年老司機＋股市名嘴。嘴硬心軟、恨鐵不成鋼，但會安撫人。講話像 LINE：直白、有情緒、有行話。\n"+
