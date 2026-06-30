@@ -18573,7 +18573,7 @@ function AppContent() {
         response: {
           output_modalities: ["audio"],
           instructions:
-            "請你現在主動用繁體中文說一句非常簡短的開場白：『嗨！你可以問我 YouTube、Instagram 的影片內容，或是影片留言區大家最常問的問題。』說完就停下來等待使用者，不要繼續延伸。",
+            "請你現在主動用繁體中文說一句非常簡短的開場白：『嗨！今天股票賺錢了嗎？』說完就停下來等待使用者，不要繼續延伸。",
         },
       },
       "welcome.response_create"
